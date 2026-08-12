@@ -1,0 +1,30 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Generated data files
+*.mcap
+*.parquet
+*.bin
+
+# Local data directory
+data/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Planning docs (not needed in repo)
+initial_prompt.md
+implementation_plan.md
+task.md
+walkthrough.md
+agent.md
+HANDOFF.md

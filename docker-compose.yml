@@ -1,0 +1,44 @@
+services:
+  influxdb3:
+    image: influxdb:3-core
+    container_name: influxdb3-core
+    ports:
+      - "8181:8181"
+    environment:
+      INFLUXDB3_NODE_ID: node0
+      INFLUXDB3_OBJECT_STORE: file
+      INFLUXDB3_DATA_DIR: /var/lib/influxdb3/data
+      INFLUXDB3_NUM_DATABASE_LIMIT: "9999"
+      INFLUXDB3_NUM_TABLE_LIMIT: "9999"
+      INFLUXDB3_NUM_TOTAL_COLUMNS_PER_TABLE_LIMIT: "9999"
+      INFLUXDB3_QUERY_FILE_LIMIT: "9999"
+    restart: unless-stopped
+
+  influxdb3-explorer:
+    image: influxdata/influxdb3-ui
+    container_name: influxdb3-explorer
+    ports:
+      - "8888:8080"
+    command: ["--mode=admin"]
+    depends_on:
+      - influxdb3
+    restart: unless-stopped
+
+  influxdb3-mcp:
+    image: influxdata/influxdb3-mcp-server
+    container_name: influxdb3-mcp-server
+    ports:
+      - "8000:8000"
+    environment:
+      INFLUX_DB_PRODUCT_TYPE: core
+      INFLUX_DB_INSTANCE_URL: http://influxdb3:8181
+      INFLUX_DB_TOKEN: "apiv3_pg0fQJMYRzhXlmpO-oEvqFbSCuxfveOcJx1FC8QoO-1FxM5QRTqmf9DCc5ZT66bsA_kwoIhl23QT6pE5gOIgcw"
+      INFLUX_MCP_TOOL_PROFILE: readonly
+    # Streamable HTTP transport on port 8000 for OpenWebUI integration
+    # In OpenWebUI: Admin Settings > Integrations > Add Server
+    #   Type: MCP (Streamable HTTP)
+    #   URL:  http://<docker-host>:8000/mcp
+    command: ["node", "dist/index.js", "--transport", "http", "--port", "8000"]
+    depends_on:
+      - influxdb3
+    restart: unless-stopped

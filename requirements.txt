@@ -1,0 +1,5 @@
+mcap
+pandas
+pyarrow
+influxdb3-python
+pymavlink
