@@ -32,7 +32,7 @@ services:
     environment:
       INFLUX_DB_PRODUCT_TYPE: core
       INFLUX_DB_INSTANCE_URL: http://influxdb3:8181
-      INFLUX_DB_TOKEN: "apiv3_pg0fQJMYRzhXlmpO-oEvqFbSCuxfveOcJx1FC8QoO-1FxM5QRTqmf9DCc5ZT66bsA_kwoIhl23QT6pE5gOIgcw"
+      INFLUX_DB_TOKEN: "apiv3_DJgNwA0ZVolWvBdDwsqG27FTNQOYcTPtQKDtQMNgcrVuQS6FBoLoCZgcKMkGiNyQy3htwNBaKwHCnvyopbCtUA"
       INFLUX_MCP_TOOL_PROFILE: readonly
     # Streamable HTTP transport on port 8000 for OpenWebUI integration
     # In OpenWebUI: Admin Settings > Integrations > Add Server

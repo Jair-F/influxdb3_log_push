@@ -15,7 +15,7 @@ from influxdb_client_3 import InfluxDBClient3
 # ---------------------------------------------------------------------------
 
 DEFAULT_HOST = "http://localhost:8181"
-DEFAULT_TOKEN = "apiv3_pg0fQJMYRzhXlmpO-oEvqFbSCuxfveOcJx1FC8QoO-1FxM5QRTqmf9DCc5ZT66bsA_kwoIhl23QT6pE5gOIgcw"
+DEFAULT_TOKEN = "apiv3_DJgNwA0ZVolWvBdDwsqG27FTNQOYcTPtQKDtQMNgcrVuQS6FBoLoCZgcKMkGiNyQy3htwNBaKwHCnvyopbCtUA"
 
 
 # ---------------------------------------------------------------------------
