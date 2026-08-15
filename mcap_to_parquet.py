@@ -13,6 +13,7 @@ Memory Strategy:
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -49,6 +50,30 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def sanitize_column_name(name: str) -> str:
+    """
+    Make a flattened column name safe to query.
+
+    Two separate problems have shown up in practice, both originating from
+    the MCAP topic names (e.g. "can/0x001", "rs232/0x41") flowing straight
+    through into column names:
+
+    1. Array indices flattened as "[0]" collide with the array/map subscript
+       operator in the SQL dialect InfluxDB 3 uses, so a column named
+       "...data[0]" fails to SELECT even quoted. flatten_dict() already
+       avoids this by using "_0" instead of "[0]".
+    2. The literal substring "0x" (from the hex-style topic names, e.g.
+       "can/0x00A") is rejected outright by the query tool — "Hex-encoded
+       values (0x...) are not allowed" — even inside a quoted identifier.
+       That's a plain text-level guard, not one that understands SQL
+       quoting, so the only reliable fix is to never emit "0x" at all.
+
+    "0x001" -> "h001" keeps the value visually hex-like (and still unique
+    per CAN id) without containing the blocked substring.
+    """
+    return re.sub(r"0[xX]", "h", name)
+
+
 def flatten_dict(
     d: Dict[str, Any],
     parent_key: str = "",
@@ -58,7 +83,14 @@ def flatten_dict(
     Flatten a nested dictionary (and lists) into a single-level dictionary.
 
     Example:
-        {"a": {"b": 1}, "c": [2, 3]} -> {"a/b": 1, "c[0]": 2, "c[1]": 3}
+        {"a": {"b": 1}, "c": [2, 3]} -> {"a/b": 1, "c_0": 2, "c_1": 3}
+
+    Note: list items are joined with "_N" rather than "[N]". Square brackets
+    are a reserved array/map-subscript operator in the SQL dialect InfluxDB 3
+    uses (DataFusion), so a column literally named "data[0]" can fail to
+    query even when quoted — the write succeeds (line protocol doesn't
+    escape brackets) but SELECT on that field errors out. Underscore is safe
+    everywhere: InfluxDB, plain SQL, Parquet, pandas.
     """
     items: List[tuple[str, Any]] = []
     for k, v in d.items():
@@ -67,7 +99,7 @@ def flatten_dict(
             items.extend(flatten_dict(v, new_key, sep=sep).items())
         elif isinstance(v, list):
             for i, item in enumerate(v):
-                items.append((f"{new_key}[{i}]", item))
+                items.append((f"{new_key}_{i}", item))
         else:
             items.append((new_key, v))
     return dict(items)
@@ -103,15 +135,19 @@ def build_pyarrow_schema(input_path: str) -> tuple[pa.Schema, int]:
 
             flat = flatten_dict(data)
             for k, v in flat.items():
-                col_name = f"{channel.topic}/{k}"
+                col_name = sanitize_column_name(f"{channel.topic}/{k}")
                 if col_name not in col_types:
                     if isinstance(v, float):
                         col_types[col_name] = pa.float64()
                     elif isinstance(v, bool):
                         col_types[col_name] = pa.bool_()
                     elif isinstance(v, int):
-                        # Heuristic: Byte arrays vs normal integers
-                        if "data[" in k:
+                        # Heuristic: byte arrays (flattened list items, which
+                        # now end in "_<index>", e.g. "data_0") vs plain
+                        # scalar integers like "id". A trailing-digit regex
+                        # is used instead of a literal "data[" substring
+                        # check so this isn't coupled to one field name.
+                        if re.search(r"_\d+$", k):
                             col_types[col_name] = pa.uint8()
                         else:
                             col_types[col_name] = pa.int32()
@@ -198,7 +234,7 @@ def main() -> None:
                 data = json.loads(message.data.decode("utf-8"))
                 flat = flatten_dict(data)
                 for k, v in flat.items():
-                    col_name = f"{channel.topic}/{k}"
+                    col_name = sanitize_column_name(f"{channel.topic}/{k}")
                     if col_name in row_data:
                         row_data[col_name] = v
             except Exception:

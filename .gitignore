@@ -8,18 +8,11 @@ __pycache__/
 *.mcap
 *.parquet
 *.bin
+*.BIN
 
 # Local data directory
 data/
-
-# IDE
-.idea/
-.vscode/
-*.swp
-
-# OS
-.DS_Store
-Thumbs.db
+influxdb3/
 
 # Planning docs (not needed in repo)
 initial_prompt.md
@@ -28,3 +21,6 @@ task.md
 walkthrough.md
 agent.md
 HANDOFF.md
+
+
+.env

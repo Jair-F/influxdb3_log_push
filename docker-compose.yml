@@ -12,6 +12,8 @@ services:
       INFLUXDB3_NUM_TABLE_LIMIT: "9999"
       INFLUXDB3_NUM_TOTAL_COLUMNS_PER_TABLE_LIMIT: "9999"
       INFLUXDB3_QUERY_FILE_LIMIT: "9999"
+    volumes:
+      - ./influxdb3/db:/var/lib/influxdb3
     restart: unless-stopped
 
   influxdb3-explorer:
@@ -22,6 +24,8 @@ services:
     command: ["--mode=admin"]
     depends_on:
       - influxdb3
+    volumes:
+      - ./influxdb3/explorer:/db
     restart: unless-stopped
 
   influxdb3-mcp:
@@ -32,13 +36,13 @@ services:
     environment:
       INFLUX_DB_PRODUCT_TYPE: core
       INFLUX_DB_INSTANCE_URL: http://influxdb3:8181
-      INFLUX_DB_TOKEN: "apiv3_DJgNwA0ZVolWvBdDwsqG27FTNQOYcTPtQKDtQMNgcrVuQS6FBoLoCZgcKMkGiNyQy3htwNBaKwHCnvyopbCtUA"
+      INFLUX_DB_TOKEN: "${INFLUXDB3_TOKEN}"
       INFLUX_MCP_TOOL_PROFILE: readonly
     # Streamable HTTP transport on port 8000 for OpenWebUI integration
     # In OpenWebUI: Admin Settings > Integrations > Add Server
     #   Type: MCP (Streamable HTTP)
     #   URL:  http://<docker-host>:8000/mcp
-    command: ["node", "dist/index.js", "--transport", "http", "--port", "8000"]
+    # command: ["node", "dist/index.js", "--transport", "http", "--port", "8000"]
     depends_on:
       - influxdb3
     restart: unless-stopped
