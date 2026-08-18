@@ -8,12 +8,15 @@ services:
       INFLUXDB3_NODE_ID: node0
       INFLUXDB3_OBJECT_STORE: file
       INFLUXDB3_DATA_DIR: /var/lib/influxdb3/data
+      INFLUXDB3_PLUGIN_DIR: /var/lib/influxdb3/plugins
       INFLUXDB3_NUM_DATABASE_LIMIT: "9999"
       INFLUXDB3_NUM_TABLE_LIMIT: "9999"
       INFLUXDB3_NUM_TOTAL_COLUMNS_PER_TABLE_LIMIT: "9999"
       INFLUXDB3_QUERY_FILE_LIMIT: "9999"
     volumes:
       - ./influxdb3/db:/var/lib/influxdb3
+    networks:
+      - isolated-net
     restart: unless-stopped
 
   influxdb3-explorer:
@@ -22,8 +25,15 @@ services:
     ports:
       - "8888:8080"
     command: ["--mode=admin"]
+    # environment:
+      # DEFAULT_INFLUX_SERVER: "http://influxdb3-core:8181"
+      # DEFAULT_INFLUX_DATABASE: "monitoring"
+      # DEFAULT_API_TOKEN: "${INFLUXDB3_TOKEN}"
+      # DEFAULT_SERVER_NAME: "Database"
     depends_on:
       - influxdb3
+    networks:
+      - isolated-net
     volumes:
       - ./influxdb3/explorer:/db
     restart: unless-stopped
@@ -45,4 +55,11 @@ services:
     # command: ["node", "dist/index.js", "--transport", "http", "--port", "8000"]
     depends_on:
       - influxdb3
+    networks:
+      - isolated-net
     restart: unless-stopped
+
+
+networks:
+  isolated-net:
+    internal: true

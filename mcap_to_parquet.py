@@ -15,22 +15,26 @@ import argparse
 import json
 import re
 import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Iterator, Optional
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 from mcap.reader import make_reader
+from mcap.records import Channel
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
 CHUNK_SIZE = 50_000
+LOG_TIME_FIELD = pa.field("log_time", pa.timestamp("ns"))
+PUBLISH_TIME_FIELD = pa.field("publish_time", pa.timestamp("ns"))
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# CLI
 # ---------------------------------------------------------------------------
 
 
@@ -48,6 +52,11 @@ def parse_args() -> argparse.Namespace:
         help="Path to the output Parquet file (default: simulated_log.parquet)",
     )
     return parser.parse_args()
+
+
+# ---------------------------------------------------------------------------
+# Column naming
+# ---------------------------------------------------------------------------
 
 
 def sanitize_column_name(name: str) -> str:
@@ -74,126 +83,179 @@ def sanitize_column_name(name: str) -> str:
     return re.sub(r"0[xX]", "h", name)
 
 
-def flatten_dict(
-    d: Dict[str, Any],
-    parent_key: str = "",
-    sep: str = "/",
-) -> Dict[str, Any]:
+def flatten_dict(d: dict[str, Any], parent_key: str = "", sep: str = "/") -> dict[str, Any]:
     """
     Flatten a nested dictionary (and lists) into a single-level dictionary.
 
     Example:
         {"a": {"b": 1}, "c": [2, 3]} -> {"a/b": 1, "c_0": 2, "c_1": 3}
 
-    Note: list items are joined with "_N" rather than "[N]". Square brackets
-    are a reserved array/map-subscript operator in the SQL dialect InfluxDB 3
-    uses (DataFusion), so a column literally named "data[0]" can fail to
-    query even when quoted — the write succeeds (line protocol doesn't
-    escape brackets) but SELECT on that field errors out. Underscore is safe
-    everywhere: InfluxDB, plain SQL, Parquet, pandas.
+    Note: list items are joined with "_N" rather than "[N]" — see
+    sanitize_column_name() for why square brackets are unsafe here.
     """
-    items: List[tuple[str, Any]] = []
-    for k, v in d.items():
-        new_key = f"{parent_key}{sep}{k}" if parent_key else k
-        if isinstance(v, dict):
-            items.extend(flatten_dict(v, new_key, sep=sep).items())
-        elif isinstance(v, list):
-            for i, item in enumerate(v):
-                items.append((f"{new_key}_{i}", item))
+    items: list[tuple[str, Any]] = []
+    for key, value in d.items():
+        new_key = f"{parent_key}{sep}{key}" if parent_key else key
+        if isinstance(value, dict):
+            items.extend(flatten_dict(value, new_key, sep=sep).items())
+        elif isinstance(value, list):
+            items.extend((f"{new_key}_{i}", item) for i, item in enumerate(value))
         else:
-            items.append((new_key, v))
+            items.append((new_key, value))
     return dict(items)
 
 
-def build_pyarrow_schema(input_path: str) -> tuple[pa.Schema, int]:
+def _is_flattened_list_item(key: str) -> bool:
+    """True for keys like "data_0" that came from a list index, not a scalar field like "id"."""
+    return re.search(r"_\d+$", key) is not None
+
+
+# ---------------------------------------------------------------------------
+# Reading MCAP messages
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class FlatMessage:
+    """One MCAP message, JSON-decoded and flattened to sanitized column names."""
+
+    channel: Channel
+    log_time: int
+    publish_time: int
+    fields: dict[str, Any]
+
+
+def iter_flat_messages(input_path: str) -> Iterator[FlatMessage]:
     """
-    Scan the MCAP file to determine all possible columns and their types.
+    Yield every MCAP message as a FlatMessage.
 
-    Args:
-        input_path: Path to the MCAP file.
+    Messages whose payload isn't valid JSON are silently skipped, matching
+    the original behavior of tolerating malformed entries rather than
+    aborting the whole conversion.
 
-    Returns:
-        (PyArrow Schema, Total message count)
+    This is the single source of truth for "how does a raw MCAP message
+    become column data" — both the schema-scanning pass and the row-writing
+    pass consume it, so the two passes can't drift out of sync with each
+    other.
     """
-    col_types: Dict[str, pa.DataType] = {}
-    total_messages = 0
-
     with open(input_path, "rb") as f:
         reader = make_reader(f)
-        summary = reader.get_summary()
-
-        # Try to get total messages from summary block
-        if summary and summary.statistics:
-            for count in summary.statistics.channel_message_counts.values():
-                total_messages += count
-
         for _, channel, message in reader.iter_messages():
             try:
-                data = json.loads(message.data.decode("utf-8"))
-            except Exception:
+                payload = json.loads(message.data.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
                 continue
 
-            flat = flatten_dict(data)
-            for k, v in flat.items():
-                col_name = sanitize_column_name(f"{channel.topic}/{k}")
-                if col_name not in col_types:
-                    if isinstance(v, float):
-                        col_types[col_name] = pa.float64()
-                    elif isinstance(v, bool):
-                        col_types[col_name] = pa.bool_()
-                    elif isinstance(v, int):
-                        # Heuristic: byte arrays (flattened list items, which
-                        # now end in "_<index>", e.g. "data_0") vs plain
-                        # scalar integers like "id". A trailing-digit regex
-                        # is used instead of a literal "data[" substring
-                        # check so this isn't coupled to one field name.
-                        if re.search(r"_\d+$", k):
-                            col_types[col_name] = pa.uint8()
-                        else:
-                            col_types[col_name] = pa.int32()
-                    else:
-                        col_types[col_name] = pa.string()
-
-    # Core timestamp fields
-    fields = [
-        pa.field("log_time", pa.timestamp("ns")),
-        pa.field("publish_time", pa.timestamp("ns")),
-    ]
-
-    # Append discovered fields deterministically
-    for col_name in sorted(col_types.keys()):
-        fields.append(pa.field(col_name, col_types[col_name]))
-
-    return pa.schema(fields), total_messages
+            fields = {
+                sanitize_column_name(f"{channel.topic}/{key}"): value
+                for key, value in flatten_dict(payload).items()
+            }
+            yield FlatMessage(
+                channel=channel, log_time=message.log_time, publish_time=message.publish_time, fields=fields
+            )
 
 
-def write_chunk(
-    writer: Optional[pq.ParquetWriter],
-    rows: Dict[str, list],
-    schema: pa.Schema,
-    output_path: str,
-) -> pq.ParquetWriter:
-    """
-    Write a chunk of row data to the Parquet file.
+def count_messages(input_path: str) -> int:
+    """Return the total message count from the MCAP summary block, or 0 if unavailable."""
+    with open(input_path, "rb") as f:
+        summary = make_reader(f).get_summary()
+    if not summary or not summary.statistics:
+        return 0
+    return sum(summary.statistics.channel_message_counts.values())
 
-    Args:
-        writer:      The current ParquetWriter (or None if first chunk).
-        rows:        Dict of column_name -> list of values.
-        schema:      The full PyArrow schema.
-        output_path: Destination file path (used only if writer is None).
 
-    Returns:
-        The ParquetWriter instance.
-    """
-    arrays = [pa.array(rows[f.name], type=f.type) for f in schema]
-    batch = pa.RecordBatch.from_arrays(arrays, schema=schema)
-    table = pa.Table.from_batches([batch])
+# ---------------------------------------------------------------------------
+# Schema inference
+# ---------------------------------------------------------------------------
 
-    if writer is None:
-        writer = pq.ParquetWriter(output_path, schema)
 
-    writer.write_table(table)
-    return writer
+def _infer_arrow_type(col_name: str, value: Any) -> pa.DataType:
+    """Pick a Parquet column type for one flattened (column name, value) pair."""
+    if isinstance(value, float):
+        return pa.float64()
+    if isinstance(value, bool):
+        return pa.bool_()
+    if isinstance(value, int):
+        # Flattened list items (column names ending "_<digits>", e.g.
+        # ".../data_0") are byte-range values in this dataset (CAN/RS232
+        # payload bytes); plain scalar integers like ".../id" are not
+        # assumed to fit a byte.
+        return pa.uint8() if _is_flattened_list_item(col_name) else pa.int32()
+    return pa.string()
+
+
+def build_pyarrow_schema(input_path: str) -> pa.Schema:
+    """Scan the MCAP file once to determine every column and its type."""
+    col_types: dict[str, pa.DataType] = {}
+
+    for message in iter_flat_messages(input_path):
+        for col_name, value in message.fields.items():
+            if col_name not in col_types:
+                col_types[col_name] = _infer_arrow_type(col_name, value)
+
+    fields = [LOG_TIME_FIELD, PUBLISH_TIME_FIELD]
+    fields.extend(pa.field(name, col_types[name]) for name in sorted(col_types))
+    return pa.schema(fields)
+
+
+# ---------------------------------------------------------------------------
+# Writing Parquet
+# ---------------------------------------------------------------------------
+
+
+class ChunkedParquetWriter:
+    """Accumulates rows in column-oriented form and flushes full chunks to disk."""
+
+    def __init__(self, schema: pa.Schema, output_path: str, chunk_size: int = CHUNK_SIZE):
+        self._schema = schema
+        self._output_path = output_path
+        self._chunk_size = chunk_size
+        self._writer: Optional[pq.ParquetWriter] = None
+        self._columns: dict[str, list] = {field.name: [] for field in schema}
+        self._buffered_rows = 0
+
+    def add_row(self, row: dict[str, Any]) -> None:
+        """Buffer one row (dict of column name -> value), flushing if the chunk is full."""
+        for field in self._schema:
+            self._columns[field.name].append(row.get(field.name))
+        self._buffered_rows += 1
+        if self._buffered_rows >= self._chunk_size:
+            self._flush()
+
+    def close(self) -> None:
+        """Flush any remaining buffered rows and close the underlying writer."""
+        self._flush()
+        if self._writer is not None:
+            self._writer.close()
+
+    def _flush(self) -> None:
+        if self._buffered_rows == 0:
+            return
+        arrays = [pa.array(self._columns[field.name], type=field.type) for field in self._schema]
+        table = pa.Table.from_batches([pa.RecordBatch.from_arrays(arrays, schema=self._schema)])
+
+        if self._writer is None:
+            self._writer = pq.ParquetWriter(self._output_path, self._schema)
+        self._writer.write_table(table)
+
+        self._columns = {field.name: [] for field in self._schema}
+        self._buffered_rows = 0
+
+
+def _row_from_message(message: FlatMessage, schema: pa.Schema) -> dict[str, Any]:
+    """Build one output row: timestamps plus whichever schema columns this message populates."""
+    row: dict[str, Any] = {"log_time": message.log_time, "publish_time": message.publish_time}
+    field_names = {field.name for field in schema}
+    row.update((name, value) for name, value in message.fields.items() if name in field_names)
+    return row
+
+
+def _print_progress(processed: int, total: int) -> None:
+    if total > 0:
+        pct = (processed / total) * 100
+        print(f"  Progress: {pct:.1f}% ({processed}/{total})")
+    else:
+        print(f"  Progress: {processed} messages")
 
 
 # ---------------------------------------------------------------------------
@@ -211,63 +273,23 @@ def main() -> None:
         sys.exit(1)
 
     print("Pass 1: Scanning all messages to build the schema…")
-    pq_schema, total_messages = build_pyarrow_schema(args.input)
-    fields = list(pq_schema)
-    print(f"  Schema built with {len(fields)} columns.")
+    schema = build_pyarrow_schema(args.input)
+    total_messages = count_messages(args.input)
+    print(f"  Schema built with {len(schema)} columns.")
 
     print("Pass 2: Converting messages in chunks…")
-    rows: Dict[str, list] = {f.name: [] for f in fields}
+    writer = ChunkedParquetWriter(schema, args.output)
+
     messages_processed = 0
-    writer: Optional[pq.ParquetWriter] = None
+    for message in iter_flat_messages(args.input):
+        writer.add_row(_row_from_message(message, schema))
+        messages_processed += 1
+        if messages_processed % CHUNK_SIZE == 0:
+            _print_progress(messages_processed, total_messages)
 
-    with open(args.input, "rb") as f:
-        reader = make_reader(f)
-
-        for _, channel, message in reader.iter_messages():
-            # Initialize empty row
-            row_data: Dict[str, Any] = {f.name: None for f in fields}
-            row_data["log_time"] = message.log_time
-            row_data["publish_time"] = message.publish_time
-
-            # Parse and map JSON payload
-            try:
-                data = json.loads(message.data.decode("utf-8"))
-                flat = flatten_dict(data)
-                for k, v in flat.items():
-                    col_name = sanitize_column_name(f"{channel.topic}/{k}")
-                    if col_name in row_data:
-                        row_data[col_name] = v
-            except Exception:
-                pass
-
-            # Append to column arrays
-            for field in fields:
-                rows[field.name].append(row_data[field.name])
-
-            messages_processed += 1
-
-            # Write full chunks
-            if messages_processed % CHUNK_SIZE == 0:
-                writer = write_chunk(writer, rows, pq_schema, args.output)
-                # Clear buffer
-                rows = {f.name: [] for f in fields}
-
-                if total_messages > 0:
-                    pct = (messages_processed / total_messages) * 100
-                    print(
-                        f"  Progress: {pct:.1f}% ({messages_processed}/{total_messages})"
-                    )
-                else:
-                    print(f"  Progress: {messages_processed} messages")
-
-        # Write remaining partial chunk
-        if messages_processed % CHUNK_SIZE != 0:
-            writer = write_chunk(writer, rows, pq_schema, args.output)
-            if total_messages > 0:
-                print(f"  Progress: 100.0% ({messages_processed}/{total_messages})")
-
-    if writer:
-        writer.close()
+    writer.close()
+    if messages_processed % CHUNK_SIZE != 0:
+        _print_progress(messages_processed, total_messages)
 
     print(f"\nDone — saved Parquet to {args.output}")
 

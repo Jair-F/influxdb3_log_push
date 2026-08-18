@@ -12,13 +12,12 @@ Measurement Strategy:
     Writing everything into a single measurement means a query for one
     field spends most of its rows on other channels' nulls (92-99% null
     in this dataset, since CAN/sensor/RS232 sample at very different
-    rates: 100 Hz / 10 Hz / 5 Hz). By default this script now splits
-    columns by their top-level topic ("can", "sensor", "rs232") and
-    writes each domain to its own measurement (``<domain>_data``),
-    dropping rows that carry no data for that domain. InfluxDB still
-    merges same-timestamp writes into one point server-side, so no data
-    is lost — each domain's table is just dense instead of sparse.
-    Pass --single-measurement to restore the old combined-table behavior.
+    rates: 100 Hz / 10 Hz / 5 Hz). This script splits columns by their
+    top-level topic ("can", "sensor", "rs232") and writes each domain to
+    its own measurement (``<domain>_data``), dropping rows that carry no
+    data for that domain. InfluxDB still merges same-timestamp writes
+    into one point server-side, so no data is lost — each domain's table
+    is just dense instead of sparse.
 
 Integer Preservation:
     Parquet stores the CAN/RS232 byte columns as uint8, but every row
@@ -26,7 +25,7 @@ Integer Preservation:
     represent null. PyArrow's default Parquet->pandas conversion silently
     upcasts such columns to float64, so byte values were being written to
     InfluxDB as floats (`=5.0`) instead of integers (`=5i`). This script
-    now reads row groups with a types_mapper that keeps them as pandas'
+    reads row groups with a types_mapper that keeps them as pandas'
     nullable Int64 dtype, which round-trips through the write client as
     a proper integer field.
 
@@ -37,11 +36,14 @@ Memory Strategy:
 
 import argparse
 import time
+from dataclasses import dataclass
 
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 from influxdb_client_3 import InfluxDBClient3
+
+import influx_cli
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -50,56 +52,26 @@ from influxdb_client_3 import InfluxDBClient3
 # Maximum rows per InfluxDB write to stay under 10 MB payload limit
 WRITE_CHUNK_SIZE = 10_000
 
+DEFAULT_DATABASE = "sensor_logs"
+
 
 # ---------------------------------------------------------------------------
-# Helpers
+# CLI
 # ---------------------------------------------------------------------------
 
 
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
-    parser = argparse.ArgumentParser(
-        description="Push Parquet data to InfluxDB 3.",
-    )
+    parser = argparse.ArgumentParser(description="Push Parquet data to InfluxDB 3.")
     parser.add_argument("parquet_file", help="Path to the input Parquet file.")
-    parser.add_argument(
-        "--host",
-        default="http://localhost:8181",
-        help="InfluxDB host URL (default: http://localhost:8181)",
-    )
-    parser.add_argument(
-        "--token",
-        default="",
-        help="InfluxDB authentication token",
-    )
-    parser.add_argument(
-        "--database",
-        default="sensor_logs",
-        help="Target database name (default: sensor_logs)",
-    )
-    parser.add_argument(
-        "--measurement",
-        default="sensor_data",
-        help="Target measurement name (default: sensor_data)",
-    )
-    parser.add_argument(
-        "--vehicle",
-        default="",
-        help="Optional vehicle name to add as a tag (e.g., drone1)",
-    )
-    parser.add_argument(
-        "--single-measurement",
-        action="store_true",
-        help=(
-            "Write every column into one combined measurement (named by "
-            "--measurement), matching the old behavior. By default, columns "
-            "are split by domain (can/sensor/rs232) into their own "
-            "measurements (<domain>_data) since mixing sample rates that "
-            "differ 20x in one wide table leaves most fields null on most "
-            "rows."
-        ),
-    )
+    influx_cli.add_connection_args(parser, default_database=DEFAULT_DATABASE)
+    influx_cli.add_vehicle_arg(parser)
     return parser.parse_args()
+
+
+# ---------------------------------------------------------------------------
+# Parquet -> pandas, preserving integer columns
+# ---------------------------------------------------------------------------
 
 
 def _types_mapper(arrow_type: pa.DataType):
@@ -115,9 +87,26 @@ def _types_mapper(arrow_type: pa.DataType):
     pandas' extension Int64Dtype for integer Arrow types preserves the
     original integer semantics through the null-heavy conversion.
     """
-    if pa.types.is_integer(arrow_type):
-        return pd.Int64Dtype()
-    return None
+    return pd.Int64Dtype() if pa.types.is_integer(arrow_type) else None
+
+
+def _read_row_group_as_frame(parquet_file: pq.ParquetFile, row_group_index: int) -> pd.DataFrame:
+    """Read one row group and shape it for writing: indexed by publish_time, log_time as int64."""
+    df = parquet_file.read_row_group(row_group_index).to_pandas(types_mapper=_types_mapper)
+
+    df["publish_time"] = pd.to_datetime(df["publish_time"])
+    df.set_index("publish_time", inplace=True)
+
+    if "log_time" in df.columns:
+        df["log_time"] = pd.to_datetime(df["log_time"]).astype("int64")
+
+    df.dropna(axis=1, how="all", inplace=True)  # columns entirely empty in this row group
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Splitting by domain
+# ---------------------------------------------------------------------------
 
 
 def split_by_domain(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
@@ -136,57 +125,71 @@ def split_by_domain(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
     that would otherwise be all-null.
 
     Args:
-        df: Wide dataframe indexed by publish_time, as produced for one
-            Parquet row group (log_time already cast, publish_time already
-            the index, fully-empty columns already dropped).
+        df: Wide dataframe indexed by publish_time, as produced by
+            _read_row_group_as_frame().
 
     Returns:
         Dict mapping domain name (e.g. "can") to its own dataframe.
     """
-    domain_cols: dict[str, list[str]] = {}
-    for col in df.columns:
-        if col == "log_time":
+    domain_columns: dict[str, list[str]] = {}
+    for column in df.columns:
+        if column == "log_time":
             continue
-        domain_cols.setdefault(col.split("/", 1)[0], []).append(col)
+        domain_columns.setdefault(column.split("/", 1)[0], []).append(column)
 
     frames: dict[str, pd.DataFrame] = {}
-    for domain, cols in domain_cols.items():
-        keep = (["log_time"] if "log_time" in df.columns else []) + cols
-        sub = df[keep].dropna(subset=cols, how="all").copy()
-        if not sub.empty:
-            frames[domain] = sub
+    for domain, columns in domain_columns.items():
+        keep = (["log_time"] if "log_time" in df.columns else []) + columns
+        frame = df[keep].dropna(subset=columns, how="all").copy()
+        if not frame.empty:
+            frames[domain] = frame
     return frames
 
 
-def write_in_chunks(
-    client: InfluxDBClient3,
-    df: pd.DataFrame,
-    measurement: str,
-    vehicle: str = "",
-) -> None:
+# ---------------------------------------------------------------------------
+# Writing to InfluxDB
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class WriteTarget:
+    """Where a batch of rows should land in InfluxDB."""
+
+    measurement: str
+    vehicle: str = ""
+
+
+def write_in_chunks(client: InfluxDBClient3, df: pd.DataFrame, target: WriteTarget) -> None:
     """
     Write a DataFrame to InfluxDB in sub-chunks.
 
     Splitting avoids hitting the 10 MB payload limit on large row groups.
-
-    Args:
-        client:      InfluxDB client.
-        df:          DataFrame with a DatetimeIndex to write.
-        measurement: Target measurement name in InfluxDB.
-        vehicle:     Optional vehicle tag.
     """
-    tag_columns = []
-    if vehicle:
-        df["vehicle"] = vehicle
+    tag_columns = None
+    if target.vehicle:
+        df["vehicle"] = target.vehicle
         tag_columns = ["vehicle"]
 
     for start in range(0, len(df), WRITE_CHUNK_SIZE):
         chunk = df.iloc[start : start + WRITE_CHUNK_SIZE]
         client.write(
             record=chunk,
-            data_frame_measurement_name=measurement,
-            data_frame_tag_columns=tag_columns if tag_columns else None,
+            data_frame_measurement_name=target.measurement,
+            data_frame_tag_columns=tag_columns,
         )
+
+
+def _write_row_group(client: InfluxDBClient3, df: pd.DataFrame, vehicle: str) -> int:
+    """Split one row group's frame by domain and write each to its own measurement.
+
+    Returns the number of rows written.
+    """
+    rows_written = 0
+    for domain, frame in split_by_domain(df).items():
+        target = WriteTarget(measurement=f"{domain}_data", vehicle=vehicle)
+        write_in_chunks(client, frame, target)
+        rows_written += len(frame)
+    return rows_written
 
 
 # ---------------------------------------------------------------------------
@@ -195,11 +198,10 @@ def write_in_chunks(
 
 
 def main() -> None:
-    """Read a Parquet file and push to InfluxDB."""
+    """Read a Parquet file and push to InfluxDB, split by domain measurement."""
     args = parse_args()
     wall_start = time.time()
 
-    # --- Open file ---
     print(f"Opening Parquet file: {args.parquet_file}")
     try:
         parquet_file = pq.ParquetFile(args.parquet_file)
@@ -207,38 +209,24 @@ def main() -> None:
         print(f"Error opening Parquet file: {e}")
         return
 
-    # Validate that publish_time exists
-    schema = parquet_file.schema.to_arrow_schema()
-    if "publish_time" not in schema.names:
+    if "publish_time" not in parquet_file.schema.to_arrow_schema().names:
         print("Error: Parquet file must contain a 'publish_time' column.")
         return
 
-    # --- Connect ---
     try:
-        client = InfluxDBClient3(
-            host=args.host, token=args.token, database=args.database
-        )
+        client = InfluxDBClient3(host=args.host, token=args.token, database=args.database)
     except Exception as e:
         print(f"Error connecting to InfluxDB: {e}")
         return
 
     total_row_groups = parquet_file.num_row_groups
     total_rows = 0
-
     print(f"Pushing to InfluxDB. Row groups: {total_row_groups}")
+    print("Measurements: can_data / sensor_data / rs232_data")
 
-    if args.single_measurement:
-        print(f"Mode: single measurement ({args.measurement!r})")
-    else:
-        print("Mode: split by domain (can_data / sensor_data / rs232_data / ...)")
-
-    # --- Process row groups ---
     for i in range(total_row_groups):
         try:
-            # types_mapper keeps nullable integer columns (the CAN/RS232
-            # byte fields) as pandas Int64 instead of silently upcasting
-            # them to float64, which is numpy's only way to hold a null.
-            df = parquet_file.read_row_group(i).to_pandas(types_mapper=_types_mapper)
+            df = _read_row_group_as_frame(parquet_file, i)
         except Exception as e:
             print(f"Error reading row group {i}: {e}")
             break
@@ -246,25 +234,8 @@ def main() -> None:
         if df.empty:
             continue
 
-        # Set publish_time as the InfluxDB timestamp index
-        df["publish_time"] = pd.to_datetime(df["publish_time"])
-        df.set_index("publish_time", inplace=True)
-
-        # Keep log_time as a regular field (int64 nanoseconds)
-        if "log_time" in df.columns:
-            df["log_time"] = pd.to_datetime(df["log_time"]).astype("int64")
-
-        # Drop columns that are entirely NaN in this chunk
-        df.dropna(axis=1, how="all", inplace=True)
-
         try:
-            if args.single_measurement:
-                write_in_chunks(client, df, args.measurement, args.vehicle)
-                total_rows += len(df)
-            else:
-                for domain, sub_df in split_by_domain(df).items():
-                    write_in_chunks(client, sub_df, f"{domain}_data", args.vehicle)
-                    total_rows += len(sub_df)
+            total_rows += _write_row_group(client, df, args.vehicle)
         except Exception as e:
             print(f"Error writing to InfluxDB: {e}")
             break
